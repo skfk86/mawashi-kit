@@ -1,0 +1,300 @@
+rules_version = '2';
+// {{APP_NAME}} — قواعد الأمان (المرحلة الأولى)
+// المبدأ: التطبيق لا يكتب أبداً على المال أو الصلاحيات أو التوثيق. كل ذلك من السيرفر (Admin SDK يتجاوز هذه القواعد).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isMe(uid) { return signedIn() && request.auth.uid == uid; }
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    // حساب موقوف من الإدارة: يقرأ فقط ولا ينشئ شيئاً
+    function notBanned() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('banned', false) != true;
+    }
+
+    // الحقول التي يحق للمستخدم كتابتها في ملفه
+    function userFields() {
+      return ['name', 'photo', 'state', 'city', 'isSeller',
+              'walletOn', 'fcmToken', 'createdAt', 'updatedAt'];
+    }
+    // التفعيل كبائع، واسم المتجر، ورقم واتساب: من السيرفر فقط بعد تأكيد الرقم (/api/seller)
+    function ownerEditable() {
+      return ['name', 'photo', 'state', 'city', 'walletOn', 'fcmToken', 'updatedAt'];
+    }
+    function validUser(d) {
+      return str(d.name, 2, 60)
+        && str(d.state, 2, 40)
+        && str(d.city, 2, 60)
+        && (!('photo' in d) || str(d.photo, 0, 500))
+        && (!('isSeller' in d) || d.isSeller is bool)
+        && (!('storeName' in d) || str(d.storeName, 2, 60))
+        && (!('whatsapp' in d) || d.whatsapp.matches('^\\+?[0-9]{9,15}$'))
+        && (!('walletOn' in d) || d.walletOn is bool)
+        && (!('fcmToken' in d) || str(d.fcmToken, 0, 400));
+    }
+    // البائع لا يستطيع إلغاء البيع من التطبيق بعد التفعيل (يتم عبر الدعم)
+    function sellerNotDowngraded() {
+      return !(resource.data.get('isSeller', false) == true && request.resource.data.get('isSeller', false) == false);
+    }
+    // التفعيل كبائع يتطلب اسم متجر وواتساب
+    function sellerComplete(d) {
+      return d.get('isSeller', false) == false || ('storeName' in d && 'whatsapp' in d);
+    }
+
+    // ===== المستخدمون (ملف عام: يُقرأ من أي مستخدم مسجّل) =====
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if isMe(uid)
+        && request.resource.data.keys().hasOnly(userFields())
+        && validUser(request.resource.data)
+        && request.resource.data.get('isSeller', false) == false;
+      // الأدمن: التوثيق، الإيقاف، التحذيرات
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['verified', 'banned', 'banReason', 'warnings', 'reportsDismissed', 'updatedAt']);
+      allow update: if isMe(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(ownerEditable())
+        && validUser(request.resource.data);
+      allow delete: if false;
+
+      // ===== بيانات خاصة (حساب بنكك): للمالك والأدمن فقط =====
+      match /private/{docId} {
+        allow read: if isMe(uid) || isAdmin();
+        allow write: if isMe(uid) && docId == 'payout'
+          && request.resource.data.keys().hasOnly(['bankak', 'updatedAt'])
+          && request.resource.data.bankak.matches('^[0-9]{6,20}$');
+      }
+    }
+
+    // ===== المفضلة: لكل مستخدم قائمته الخاصة =====
+    match /users/{uid}/favorites/{listingId} {
+      allow read, delete: if isMe(uid);
+      allow create: if isMe(uid) && request.resource.data.keys().hasOnly(['createdAt']);
+    }
+
+    // ===== الإعلانات =====
+    function amSeller() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isSeller', false) == true;
+    }
+    function listingFields() {
+      return ['sellerId', 'sellerName', 'type', 'breed', 'sex', 'ageMonths', 'weightKg', 'price', 'qty',
+              'state', 'city', 'description', 'images', 'status', 'createdAt', 'updatedAt'];
+    }
+    function validListing(d) {
+      return d.type in ['goat', 'sheep', 'cattle', 'camel']
+        && str(d.breed, 2, 30)
+        && d.sex in ['m', 'f']
+        && d.ageMonths is int && d.ageMonths >= 0 && d.ageMonths <= 300
+        && (d.weightKg is int || d.weightKg is float) && d.weightKg > 0 && d.weightKg <= 2000
+        && d.price is int && d.price > 0 && d.price <= 100000000000
+        && d.qty is int && d.qty >= 1 && d.qty <= 999
+        && str(d.state, 2, 40) && str(d.city, 2, 60)
+        && str(d.sellerName, 2, 60)
+        && d.description is string && d.description.size() <= 1000
+        && d.images is list && d.images.size() >= 1 && d.images.size() <= 6
+        && d.images[0].url.matches('^https://ik\\.imagekit\\.io/{{IMAGEKIT_ID}}/.*');
+    }
+
+    match /listings/{id} {
+      // القراءة لأي مستخدم مسجّل؛ التطبيق يعرض النشط فقط في السوق
+      allow read: if signedIn();
+
+      // الإنشاء من السيرفر فقط (/api/seller): حدود، مراجعة أول إعلان، كشف المكرر
+      allow create: if false;
+
+      // صاحب الإعلان يعدّله أو يعلّمه "مباع"؛ لا يستطيع فك إيقاف الأدمن ولا تغيير المالك أو التمييز
+      allow update: if isAdmin() || (signedIn() && notBanned()
+        && resource.data.sellerId == request.auth.uid
+        && request.resource.data.sellerId == resource.data.sellerId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(listingFields())
+        // تغيير الصور يمر بمراجعة الإدارة (/api/seller editImages)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['sellerId', 'createdAt', 'images'])
+        && validListing(request.resource.data)
+        && (resource.data.status in ['hidden', 'pending']
+              ? request.resource.data.status == resource.data.status
+              : request.resource.data.status in ['active', 'sold']));
+
+      allow delete: if isAdmin() || (signedIn() && resource.data.sellerId == request.auth.uid);
+    }
+
+    // ===== الحظر: كل مستخدم يدير قائمته =====
+    match /users/{uid}/blocks/{otherId} {
+      allow read, delete: if isMe(uid);
+      allow create: if isMe(uid) && otherId != uid && request.resource.data.keys().hasOnly(['createdAt']);
+    }
+    function blockedBy(owner, other) {
+      return exists(/databases/$(database)/documents/users/$(owner)/blocks/$(other));
+    }
+
+    // ===== المحادثات: واحدة لكل (إعلان + مشترٍ) ومعرّفها listingId_buyerId =====
+    function chatDoc(chatId) { return get(/databases/$(database)/documents/chats/$(chatId)).data; }
+    function inChat(chatId) { return signedIn() && request.auth.uid in chatDoc(chatId).participants; }
+    function otherOf(c) { return c.participants[0] == request.auth.uid ? c.participants[1] : c.participants[0]; }
+
+    match /chats/{chatId} {
+      allow read: if isAdmin() || (signedIn() && (resource == null || request.auth.uid in resource.data.participants));
+
+      // البدء من السيرفر فقط (/api/seller startChat): حد يومي للمحادثات الجديدة
+      allow create: if false;
+
+      allow update: if signedIn() && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastSenderId', 'updatedAt', 'readAt'])
+        && (!('lastSenderId' in request.resource.data) || request.resource.data.lastSenderId == request.auth.uid
+            || request.resource.data.lastSenderId == resource.data.get('lastSenderId', ''));
+
+      match /messages/{msgId} {
+        allow read: if isAdmin() || inChat(chatId);
+
+        allow create: if inChat(chatId) && notBanned()
+          && request.resource.data.senderId == request.auth.uid
+          // حماية من الإغراق: رسالة واحدة كل ثانية في المحادثة
+          && request.time > chatDoc(chatId).updatedAt + duration.value(1, 's')
+          && !blockedBy(otherOf(chatDoc(chatId)), request.auth.uid)
+          && request.resource.data.keys().hasOnly(['senderId', 'kind', 'text', 'imageUrl', 'offer', 'createdAt'])
+          && (
+            (request.resource.data.kind == 'text' && str(request.resource.data.text, 1, 1000))
+            || (request.resource.data.kind == 'image' && request.resource.data.imageUrl.matches('^https://ik\\.imagekit\\.io/{{IMAGEKIT_ID}}/.*'))
+            || (request.resource.data.kind == 'offer'
+                && request.resource.data.offer.price is int && request.resource.data.offer.price > 0
+                && request.resource.data.offer.qty is int && request.resource.data.offer.qty >= 1 && request.resource.data.offer.qty <= 999
+                && request.resource.data.offer.status == 'pending'
+                && request.resource.data.offer.expiresAt is int)
+          );
+
+        // الطرف الآخر فقط يرد على العرض، مرة واحدة، وقبل انتهاء صلاحيته
+        allow update: if inChat(chatId)
+          && resource.data.kind == 'offer'
+          && resource.data.senderId != request.auth.uid
+          && resource.data.offer.status == 'pending'
+          && request.time.toMillis() < resource.data.offer.expiresAt
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['offer'])
+          && request.resource.data.offer.price == resource.data.offer.price
+          && request.resource.data.offer.qty == resource.data.offer.qty
+          && request.resource.data.offer.expiresAt == resource.data.offer.expiresAt
+          && request.resource.data.offer.status in ['accepted', 'rejected', 'countered'];
+      }
+    }
+
+    // ===== الطلبات =====
+    // الحالات: pending → accepted → (paid لبنكك) → completed ، أو rejected / cancelled
+    function listingDoc(id) { return get(/databases/$(database)/documents/listings/$(id)).data; }
+    function orderFields() {
+      return ['listingId', 'buyerId', 'sellerId', 'participants', 'buyerName', 'sellerName', 'title', 'image',
+              'unitPrice', 'qty', 'total', 'paymentMethod', 'delivery', 'note', 'offerRef', 'status',
+              'bankak', 'receiptUrl', 'cancelReason', 'cancelledBy', 'createdAt', 'updatedAt'];
+    }
+    // السعر: إما السعر المعلن، أو عرض مقبول في محادثة المشتري لهذا الإعلان
+    function priceOk(d) {
+      return d.unitPrice == listingDoc(d.listingId).price
+        || ('offerRef' in d
+            && d.offerRef.chatId == d.listingId + '_' + request.auth.uid
+            && get(/databases/$(database)/documents/chats/$(d.offerRef.chatId)/messages/$(d.offerRef.msgId)).data.offer.status == 'accepted'
+            && get(/databases/$(database)/documents/chats/$(d.offerRef.chatId)/messages/$(d.offerRef.msgId)).data.offer.price == d.unitPrice);
+    }
+    function transitionOk() {
+      let me = request.auth.uid;
+      let o = resource.data;
+      let from = o.status;
+      let to = request.resource.data.status;
+      let keys = request.resource.data.diff(o).affectedKeys();
+      // طلبات المحفظة: كل الحالات تتغير من السيرفر (/api/wallet) لأنها تحرّك المال،
+      // عدا إلغاء المشتري لطلب لم يُحجز مبلغه بعد
+      return (o.paymentMethod == 'wallet'
+          ? (me == o.buyerId && from == 'pending' && to == 'cancelled' && !('escrow' in o))
+          : (
+        (me == o.sellerId && from == 'pending' && to in ['accepted', 'rejected'])
+        || (me == o.sellerId && from == 'accepted' && to == 'paid' && o.paymentMethod == 'bankak')
+        || (me == o.sellerId && from == 'accepted' && to == 'cancelled')
+        || (me == o.buyerId && from in ['pending', 'accepted'] && to == 'cancelled')
+        || (me == o.buyerId && from == 'accepted' && to == 'accepted' && keys.hasOnly(['receiptUrl', 'updatedAt'])
+            && request.resource.data.receiptUrl.matches('^https://ik\\.imagekit\\.io/{{IMAGEKIT_ID}}/.*'))
+        || (me == o.buyerId && from in ['accepted', 'paid'] && to == 'completed')));
+    }
+
+    match /orders/{orderId} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid in resource.data.participants);
+
+      allow create: if signedIn() && notBanned()
+        && request.resource.data.keys().hasOnly(orderFields())
+        && request.resource.data.buyerId == request.auth.uid
+        && request.resource.data.sellerId == listingDoc(request.resource.data.listingId).sellerId
+        && request.resource.data.sellerId != request.auth.uid
+        && request.resource.data.participants == [request.auth.uid, request.resource.data.sellerId]
+        && listingDoc(request.resource.data.listingId).status == 'active'
+        && !blockedBy(request.resource.data.sellerId, request.auth.uid)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.unitPrice is int && request.resource.data.unitPrice > 0
+        && request.resource.data.qty is int && request.resource.data.qty >= 1
+        && request.resource.data.qty <= listingDoc(request.resource.data.listingId).qty
+        && request.resource.data.total == request.resource.data.unitPrice * request.resource.data.qty
+        && request.resource.data.paymentMethod in ['bankak', 'cash', 'wallet']
+        && request.resource.data.delivery in ['pickup', 'seller']
+        && priceOk(request.resource.data);
+
+      allow update: if isAdmin() || (signedIn()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt', 'bankak', 'receiptUrl', 'cancelReason', 'cancelledBy'])
+        && (!('cancelledBy' in request.resource.data) || request.resource.data.cancelledBy == resource.data.get('cancelledBy', request.auth.uid))
+        && transitionOk());
+    }
+
+    // ===== التقييمات: مشترٍ واحد لكل طلب مكتمل =====
+    match /reviews/{orderId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && get(/databases/$(database)/documents/orders/$(orderId)).data.buyerId == request.auth.uid
+        && get(/databases/$(database)/documents/orders/$(orderId)).data.status == 'completed'
+        && request.resource.data.sellerId == get(/databases/$(database)/documents/orders/$(orderId)).data.sellerId
+        && request.resource.data.buyerId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['sellerId', 'buyerId', 'buyerName', 'stars', 'comment', 'title', 'createdAt'])
+        && request.resource.data.stars is int && request.resource.data.stars >= 1 && request.resource.data.stars <= 5
+        && request.resource.data.comment is string && request.resource.data.comment.size() <= 500;
+    }
+
+    // ===== البلاغات: تُنشأ من السيرفر فقط (/api/report)، والأدمن يقرأ ويقرر =====
+    match /reports/{id} {
+      allow read: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decision', 'decisionNote', 'decidedBy', 'decidedAt']);
+    }
+
+    // ===== طلبات التوثيق: طلب واحد لكل بائع =====
+    match /verifyRequests/{uid} {
+      allow read: if isMe(uid) || isAdmin();
+      // التقديم من السيرفر فقط (/api/seller kycSubmit) لأنه يتحقق أن صور الهوية خاصة
+      allow update: if isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'decisionNote', 'decidedAt']);
+    }
+    // طلبات تفعيل البائعين (تُنشأ من السيرفر)
+    match /sellerApps/{uid} {
+      allow read: if isMe(uid) || isAdmin();
+    }
+
+    // ===== المحفظة: قراءة فقط من التطبيق، وكل الكتابة من السيرفر =====
+    match /wallets/{uid} {
+      allow read: if isMe(uid) || isAdmin();
+    }
+    match /transactions/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+    }
+    match /deposits/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+    }
+    match /withdrawals/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+    }
+
+    // ===== الإعدادات العامة (العمولة، السلالات...) =====
+    match /settings/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ===== مجموعات المراحل القادمة: مغلقة حتى تُكتب قواعدها =====
+    // wallets, transactions, withdrawals, reviews, reports, blocks
+    match /{document=**} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+  }
+}

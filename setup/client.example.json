@@ -1,0 +1,19 @@
+{
+  "APP_NAME": "اسم التطبيق بالعربي",
+  "APP_NAME_EN": "App Name",
+  "SLUG": "myapp",
+  "PACKAGE_ID": "com.example.myapp",
+  "DOMAIN": "myapp.vercel.app",
+  "SUPPORT_EMAIL": "support@example.com",
+
+  "FIREBASE_API_KEY": "",
+  "FIREBASE_PROJECT_ID": "",
+  "FIREBASE_SENDER_ID": "",
+  "FIREBASE_APP_ID": "",
+  "FIREBASE_MEASUREMENT_ID": "",
+
+  "IMAGEKIT_ID": "",
+  "IMAGEKIT_PUBLIC_KEY": "",
+
+  "SHA256": ""
+}

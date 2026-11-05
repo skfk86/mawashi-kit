@@ -1,0 +1,12 @@
+node_modules/
+android/
+service-account*.json
+.env*
+.vercel
+# ملاحظة: signing/{{SLUG}}.keystore و google-services.json مرفوعان عمداً
+# لذلك يجب أن يبقى هذا المستودع خاصاً (Private)
+public/
+signing/
+*.keystore
+tests/.sandbox/
+setup/client.json

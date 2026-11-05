@@ -1,0 +1,47 @@
+{
+  "framework": null,
+  "installCommand": "npm install --omit=dev --ignore-scripts",
+  "buildCommand": "bash scripts/vercel-build.sh",
+  "outputDirectory": "public",
+  "headers": [
+    {
+      "source": "/admin/(.*)",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        }
+      ]
+    },
+    {
+      "source": "/.well-known/assetlinks.json",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        }
+      ]
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron-release",
+      "schedule": "0 6 * * *"
+    }
+  ],
+  "functions": {
+    "api/seller.js": {
+      "includeFiles": "firestore.indexes.json"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/l/:id",
+      "destination": "/api/share?id=:id"
+    }
+  ]
+}

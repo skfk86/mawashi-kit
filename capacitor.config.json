@@ -1,0 +1,14 @@
+{
+  "appId": "{{PACKAGE_ID}}",
+  "appName": "{{APP_NAME}}",
+  "webDir": "www",
+  "server": { "androidScheme": "https" },
+  "plugins": {
+    "FirebaseAuthentication": {
+      "skipNativeAuth": true,
+      "providers": ["google.com"]
+    },
+    "StatusBar": { "style": "LIGHT", "backgroundColor": "#F7F3EC" },
+    "SplashScreen": { "launchShowDuration": 1200, "backgroundColor": "#3F5A2E", "showSpinner": false }
+  }
+}
